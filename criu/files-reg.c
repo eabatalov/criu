@@ -523,11 +523,12 @@ static void try_clean_ghost(struct remap_info *ri)
 	pr_perror(" `- XFail [%s] ghost", path);
 }
 
-static int clean_one_remap(struct file_remap *remap)
+static int clean_one_remap(struct file_remap *remap, int rmntns_root)
 {
-	int rmntns_root, ret = 0;
+	int ret = 0;
 
-	rmntns_root = mntns_get_root_by_mnt_id(remap->rmnt_id);
+	if (rmntns_root == -1)
+		rmntns_root = mntns_get_root_by_mnt_id(remap->rmnt_id);
 	if (rmntns_root < 0)
 		return -1;
 
@@ -625,7 +626,7 @@ void remap_put(struct file_remap *remap)
 {
 	mutex_lock(ghost_file_mutex);
 	if (--remap->users == 0)
-		clean_one_remap(remap);
+		clean_one_remap(remap, -1);
 	mutex_unlock(ghost_file_mutex);
 }
 
@@ -710,6 +711,70 @@ static void __rollback_link_remaps(bool do_unlink)
 
 void delete_link_remaps(void) { __rollback_link_remaps(true); }
 void free_link_remaps(void) { __rollback_link_remaps(false); }
+
+int gc_link_remaps(void)
+{
+	struct remap_info *ri;
+	struct file_remap *remap;
+
+	list_for_each_entry(ri, &remaps, list) {
+		if (ri->rfe->remap_type != REMAP_TYPE__LINKED)
+			continue;
+
+		remap = ri->rfi->remap;
+		struct ns_id *remap_mntns = lookup_nsid_by_mnt_id(remap->rmnt_id);
+
+		if (!remap_mntns) {
+			pr_err("Can't get remap %s mnt ns %d\n",
+					remap->rpath, remap->rmnt_id);
+			return -1;
+		}
+
+		if (remap_mntns->nd->cflag != CLONE_NEWNS) {
+			pr_err("Wrong clone flag of remap mntns %x (id:%d)",
+					remap_mntns->nd->cflag, remap->rmnt_id);
+			return -1;
+		}
+
+		/*
+		 * We are root ps tree item in restore cmd terms.
+		 * All the mnt namespaces and their fds are created
+		 * by root ps tree item on restore.
+		 * So we can simply use mnt ns fds here.
+		 */
+		if (clean_one_remap(remap, remap_mntns->mnt.root_fd))
+			return -1;
+	}
+
+	return 0;
+}
+
+void show_link_remaps(void)
+{
+	struct remap_info *ri;
+
+	if (list_empty(&remaps))
+		return;
+
+	list_for_each_entry(ri, &remaps, list) {
+		if (ri->rfe->remap_type != REMAP_TYPE__LINKED)
+			continue;
+
+		/* Don't print " (deleted)" suffix if it exists */
+		const char DELETED_SUFFIX[] = " (deleted)";
+		size_t path_size = strlen(ri->rfi->path) + 1;
+
+		if (path_size >= sizeof(DELETED_SUFFIX)) {
+			char *path_no_suffix = ri->rfi->path + path_size
+				- sizeof(DELETED_SUFFIX);
+			if (!strcmp(path_no_suffix, DELETED_SUFFIX))
+				path_size -= sizeof(DELETED_SUFFIX) - 1;
+		}
+
+		pr_msg("Link remap: /%s -> /%.*s\n",
+					ri->rfi->remap->rpath, (int)path_size - 1, ri->rfi->path);
+	}
+}
 
 static int create_link_remap(char *path, int len, int lfd,
 				u32 *idp, struct ns_id *nsid)
@@ -1490,7 +1555,7 @@ ext:
 
 		BUG_ON(!rfi->remap->users);
 		if (--rfi->remap->users == 0)
-			clean_one_remap(rfi->remap);
+			clean_one_remap(rfi->remap, -1);
 
 		mutex_unlock(ghost_file_mutex);
 	}

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sched.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "cr_options.h"
 #include "util.h"
@@ -785,16 +786,56 @@ void tcp_locked_conn_add(struct inet_sk_info *ii)
 	ii->sk_fd = -1;
 }
 
-void rst_unlock_tcp_connections(void)
+int rst_unlock_tcp_connections(void)
 {
 	struct inet_sk_info *ii;
 
 	/* Network will be unlocked by network-unlock scripts */
 	if (root_ns_mask & CLONE_NEWNET)
-		return;
+		return 0;
 
 	list_for_each_entry(ii, &rst_tcp_repair_sockets, rlist)
-		nf_unlock_connection_info(ii);
+		if (nf_unlock_connection_info(ii))
+			return -1;
+
+	return 0;
+}
+
+static int show_tcp_conn(struct inet_sk_info *si)
+{
+	char sip[INET_ADDR_LEN], dip[INET_ADDR_LEN];
+	int family = si->ie->family;
+
+	if (!inet_ntop(family, (void *)si->ie->src_addr, sip, INET_ADDR_LEN) ||
+			!inet_ntop(family, (void *)si->ie->dst_addr, dip, INET_ADDR_LEN)) {
+		pr_perror("nf: Can't translate ip addr");
+		return -1;
+	}
+
+	pr_msg("Locked tcp connection: %s:%d -> %s:%d\n",
+			sip, (int)si->ie->src_port, dip, (int)si->ie->dst_port);
+
+	return 0;
+}
+
+int gc_show_locked_tcp_conns(void)
+{
+	struct inet_sk_info *ii;
+
+	/*
+	 * Unshared ps tree net ns is destroyed after successful
+	 * dump. No host net ns netfilter rules are locking
+	 * TCP connections in this case.
+	 */
+	if (root_ns_mask & CLONE_NEWNET)
+		return 0;
+
+	list_for_each_entry(ii, &rst_tcp_repair_sockets, rlist) {
+		if (show_tcp_conn(ii))
+			return -1;
+	}
+
+	return 0;
 }
 
 int check_tcp(void)

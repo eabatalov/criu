@@ -680,20 +680,34 @@ class criu_cli:
 		return os.path.join(self.__dump_path, "%d" % self.__iter)
 
 	@staticmethod
-	def __criu(action, args, fault = None, strace = [], preexec = None):
+	def __criu(action, args, fault = None, strace = [], preexec = None,
+		cap_output = False):
 		env = None
 		if fault:
 			print "Forcing %s fault" % fault
 			env = dict(os.environ, CRIU_FAULT = fault)
-		cr = subprocess.Popen(strace + [criu_bin, action] + args, env = env, preexec_fn = preexec)
-		return cr.wait()
+
+		subproc_args = {"args": strace + [criu_bin, action] + args,
+			"env": env, "preexec_fn": preexec}
+		if cap_output:
+			subproc_args["stdout"] = subprocess.PIPE
+			subproc_args["stderr"] = subprocess.PIPE
+		cr = subprocess.Popen(**subproc_args)
+
+		stdout_str = None
+		stderr_str = None
+		if cap_output:
+			stdout_str, stderr_str = cr.communicate()
+		else:
+			cr.wait()
+		return (cr.returncode, stdout_str, stderr_str)
 
 	def set_user_id(self):
 		# Numbers should match those in zdtm_test
 		os.setresgid(58467, 58467, 58467)
 		os.setresuid(18943, 18943, 18943)
 
-	def __criu_act(self, action, opts, log = None):
+	def __criu_act(self, action, opts, log = None, cap_output = False):
 		if not log:
 			log = action + ".log"
 
@@ -722,7 +736,8 @@ class criu_cli:
 
 		__ddir = self.__ddir()
 
-		ret = self.__criu(action, s_args, self.__fault, strace, preexec)
+		ret, stdout_str, stderr_str = self.__criu(
+			action, s_args, self.__fault, strace, preexec, cap_output = cap_output)
 		grep_errors(os.path.join(__ddir, log))
 		if ret != 0:
 			if self.__fault and int(self.__fault) < 128:
@@ -737,14 +752,16 @@ class criu_cli:
 					os.rename(os.path.join(__ddir, log), os.path.join(__ddir, log + ".fail"))
 				# try again without faults
 				print "Run criu " + action
-				ret = self.__criu(action, s_args, False, strace, preexec)
+				ret, stdout_str, stderr_str = self.__criu(
+					action, s_args, False, strace, preexec, cap_output = cap_output)
 				grep_errors(os.path.join(__ddir, log))
 				if ret == 0:
-					return
+					return (ret, stdout_str, stderr_str)
 			if self.__test.blocking() or (self.__sat and action == 'restore'):
 				raise test_fail_expected_exc(action)
 			else:
 				raise test_fail_exc("CRIU %s" % action)
+		return (ret, stdout_str, stderr_str)
 
 	def dump(self, action, opts = []):
 		self.__iter += 1
@@ -803,9 +820,15 @@ class criu_cli:
 			r_opts.append("zdtm:%s" % criu_dir)
 		self.__criu_act("restore", opts = r_opts + ["--restore-detached"])
 
+	def gc(self, show):
+		opts = self.__test.getropts()
+		if show:
+			opts.append("--show")
+		return self.__criu_act("gc", opts, cap_output = True)
+
 	@staticmethod
 	def check(feature):
-		return criu_cli.__criu("check", ["-v0", "--feature", feature]) == 0
+		return criu_cli.__criu("check", ["-v0", "--feature", feature])[0] == 0
 
 	@staticmethod
 	def available():
@@ -814,13 +837,42 @@ class criu_cli:
 			sys.exit(1)
 
 
-def try_run_hook(test, args):
-	hname = test.getname() + '.hook'
-	if os.access(hname, os.X_OK):
-		print "Running %s(%s)" % (hname, ', '.join(args))
-		hook = subprocess.Popen([hname] + args)
-		if hook.wait() != 0:
-			raise test_fail_exc("hook " + " ".join(args))
+def hook_name(test):
+	return test.getname() + '.hook'
+
+
+def run_hook(test, args, cap_output = False):
+	stdout_str = None
+	stderr_str = None
+
+	subproc_args = {"args": [hook_name(test)] + args}
+	if cap_output:
+		subproc_args["stdout"] = subprocess.PIPE
+		subproc_args["stderr"] = subprocess.PIPE
+	print "Running %s" % str(subproc_args)
+	try:
+		hook = subprocess.Popen(**subproc_args)
+		if cap_output:
+			stdout_str, stderr_str = hook.communicate()
+		else:
+			hook.wait()
+		if hook.returncode != 0:
+			print "Hook %s return code %d" % (
+				hook_name(test), hook.returncode)
+			if cap_output:
+				print stdout_str
+				print stderr_str
+			raise Exception()
+	except:
+		raise test_fail_exc("hook " + " ".join(args))
+
+	return (stdout_str, stderr_str)
+
+
+def try_run_hook(test, args, cap_output = False):
+	if os.access(hook_name(test), os.X_OK):
+		return run_hook(test, args, cap_output)
+	return (None, None)
 
 #
 # Step by step execution
@@ -1040,6 +1092,46 @@ def check_unshare_state(t):
 	cmp_ns("/proc/%s/ns/net" % t.getpid(), '!=', "/proc/self/ns/net", "unshare net")
 
 
+def do_run_test_cr(cr_api, test, opts):
+	state = get_visible_state(test)
+	cr(cr_api, test, opts)
+	check_visible_state(test, state, opts)
+	if opts['join_ns']:
+		check_joinns_state(test)
+	if opts['unshare']:
+		check_unshare_state(test)
+	test.stop()
+
+
+def do_run_test_gc(cr_api, test, flavor):
+	cr_api.set_test(test)
+	sbs('pre-dump')
+	cr_api.dump("dump")
+	test.gone()
+
+	sbs('pre-gc-show')
+	gc_output = cr_api.gc(True)[1]
+
+	hook_output = eval(run_hook(test, ['--gc'], cap_output = True)[0])
+	hook_lremaps = hook_output.get('lremaps') or []
+	hook_tcps = hook_output.get('tcps') or []
+
+	for lremap in hook_lremaps:
+		regex = 'Link remap: ' + lremap[0] + ' -> ' + lremap[1]
+		if not re.search(regex, gc_output):
+			raise test_fail_exc('No garbage for regex: %s' % regex)
+
+	if flavor == 'h':
+		for tcp in hook_tcps:
+			regex = 'Locked tcp connection: ' + tcp[0] + ' -> ' + tcp[1]
+			if not re.search(regex, gc_output):
+				raise test_fail_exc('No garbage for regex: %s' % regex)
+
+	sbs('pre-gc')
+	cr_api.gc(False)
+	test.kill()
+
+
 def do_run_test(tname, tdesc, flavs, opts):
 	tcname = tname.split('/')[0]
 	tclass = test_classes.get(tcname, None)
@@ -1065,20 +1157,15 @@ def do_run_test(tname, tdesc, flavs, opts):
 
 		try:
 			t.start()
-			s = get_visible_state(t)
 			try:
-				cr(cr_api, t, opts)
+				if opts['gc']:
+					do_run_test_gc(cr_api, t, f)
+				else:
+					do_run_test_cr(cr_api, t, opts)
+				try_run_hook(t, ["--clean"])
 			except test_fail_expected_exc as e:
 				if e.cr_action == "dump":
 					t.stop()
-			else:
-				check_visible_state(t, s, opts)
-				if opts['join_ns']:
-					check_joinns_state(t)
-				if opts['unshare']:
-					check_unshare_state(t)
-				t.stop()
-				try_run_hook(t, ["--clean"])
 		except test_fail_exc as e:
 			print_sep("Test %s FAIL at %s" % (tname, e.step), '#')
 			t.print_output()
@@ -1152,7 +1239,7 @@ class launcher:
 		self.__nr += 1
 		self.__show_progress()
 
-		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'unshare',
+		nd = ('nocr', 'norst', 'gc', 'pre', 'iters', 'page_server', 'sibling', 'unshare',
 				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script',
 				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run')
 		arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
@@ -1594,6 +1681,7 @@ rp.add_argument("--snaps", help = "Instead of pre-dumps do full dumps", action =
 rp.add_argument("--dedup", help = "Auto-deduplicate images on iterations", action = 'store_true')
 rp.add_argument("--nocr", help = "Do not CR anything, just check test works", action = 'store_true')
 rp.add_argument("--norst", help = "Don't restore tasks, leave them running after dump", action = 'store_true')
+rp.add_argument("--gc", help = "Don't restore tasks. Run gc after dump and validate its success", action = 'store_true')
 rp.add_argument("--iters", help = "Do CR cycle several times before check (n[:pause])")
 rp.add_argument("--fault", help = "Test fault injection")
 rp.add_argument("--sat", help = "Generate criu strace-s for sat tool (restore is fake, images are kept)", action = 'store_true')
