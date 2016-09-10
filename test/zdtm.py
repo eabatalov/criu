@@ -673,15 +673,29 @@ join_ns_file = '/run/netns/zdtm_netns'
 
 class criu_cli:
 	@staticmethod
-	def run(action, args, fault = None, strace = [], preexec = None):
+	def run(action, args, fault = None, strace = [], preexec = None,
+		cap_output = False):
 		env = None
 		if fault:
 			print "Forcing %s fault" % fault
 			env = dict(os.environ, CRIU_FAULT = fault)
-		cr = subprocess.Popen(strace + [criu_bin, action] + args, env = env, preexec_fn = preexec)
+
+		subproc_args = {"args": strace + [criu_bin, action] + args,
+			"env": env, "preexec_fn": preexec}
+		if cap_output:
+			subproc_args["stdout"] = subprocess.PIPE
+			subproc_args["stderr"] = subprocess.PIPE
+		cr = subprocess.Popen(**subproc_args)
 		if action == "lazy-pages":
 			return cr
-		return cr.wait()
+
+		result = {'returncode': None, 'stdout': None, 'stderr': None}
+		if cap_output:
+			result['stdout'], result['stderr'] = cr.communicate()
+		else:
+			cr.wait()
+		result['returncode'] = cr.returncode
+		return result
 
 
 class criu_rpc:
@@ -719,13 +733,16 @@ class criu_rpc:
 			raise test_fail_exc('RPC for %s required' % arg)
 
 	@staticmethod
-	def run(action, args, fault = None, strace = [], preexec = None):
+	def run(action, args, fault = None, strace = [], preexec = None,
+		cap_output = False):
 		if fault:
 			raise test_fail_exc('RPC and FAULT not supported')
 		if strace:
 			raise test_fail_exc('RPC and SAT not supported')
 		if preexec:
 			raise test_fail_exc('RPC and PREEXEC not supported')
+		if cap_output:
+			raise test_fail_exc('RPC and CAP_OUTPUT not supported')
 
 		ctx = {}  # Object used to keep info untill action is done
 		criu = crpc.criu()
@@ -748,7 +765,7 @@ class criu_rpc:
 		imgd = ctx.get('imgd')
 		if imgd:
 			os.close(imgd)
-		return 0
+		return {'returncode': 0, 'stdout': None, 'stderr': None}
 
 
 class criu:
@@ -800,7 +817,7 @@ class criu:
 		os.setresgid(58467, 58467, 58467)
 		os.setresuid(18943, 18943, 18943)
 
-	def __criu_act(self, action, opts, log = None):
+	def __criu_act(self, action, opts, log = None, cap_output = False):
 		if not log:
 			log = action + ".log"
 
@@ -829,12 +846,13 @@ class criu:
 
 		__ddir = self.__ddir()
 
-		ret = self.__criu.run(action, s_args, self.__fault, strace, preexec)
+		result = self.__criu.run(action, s_args, self.__fault, strace, preexec,
+			cap_output = cap_output)
 		if action == "lazy-pages":
-			return ret
+			return result
 
 		grep_errors(os.path.join(__ddir, log))
-		if ret != 0:
+		if result['returncode'] != 0:
 			if self.__fault and int(self.__fault) < 128:
 				try_run_hook(self.__test, ["--fault", action])
 				if action == "dump":
@@ -847,14 +865,16 @@ class criu:
 					os.rename(os.path.join(__ddir, log), os.path.join(__ddir, log + ".fail"))
 				# try again without faults
 				print "Run criu " + action
-				ret = self.__criu.run(action, s_args, False, strace, preexec)
+				result = self.__criu.run(action, s_args, False, strace, preexec,
+					cap_output = cap_output)
 				grep_errors(os.path.join(__ddir, log))
-				if ret == 0:
-					return
+				if result['returncode'] == 0:
+					return result
 			if self.__test.blocking() or (self.__sat and action == 'restore'):
 				raise test_fail_expected_exc(action)
 			else:
 				raise test_fail_exc("CRIU %s" % action)
+		return result
 
 	def dump(self, action, opts = []):
 		self.__iter += 1
@@ -938,7 +958,8 @@ class criu:
 
 	@staticmethod
 	def check(feature):
-		return criu_cli.run("check", ["-v0", "--feature", feature]) == 0
+		result = criu_cli.run("check", ["-v0", "--feature", feature])
+		return result['returncode'] == 0
 
 	@staticmethod
 	def available():
