@@ -119,7 +119,7 @@ static int prepare_signals(int pid, struct task_restore_args *, CoreEntry *core)
 
 static int crtools_prepare_shared(void)
 {
-	if (prepare_shared_fdinfo())
+	if (prepare_files())
 		return -1;
 
 	/* We might want to remove ghost files on failed restore */

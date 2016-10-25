@@ -53,7 +53,7 @@
 #define FDESC_HASH_SIZE	64
 static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
 
-int prepare_shared_fdinfo(void)
+int prepare_files(void)
 {
 	int i;
 
